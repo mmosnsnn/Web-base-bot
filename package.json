@@ -1,0 +1,22 @@
+{
+  "name": "whatsapp-song-bot",
+  "version": "1.0.0",
+  "description": "A WhatsApp bot that can search, download songs, convert audio formats, and manage group commands.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "whatsapp-web.js": "^1.18.2",
+    "yt-search": "^2.10.1",
+    "ytdl-core": "^4.9.1",
+    "qrcode-terminal": "^0.12.0",
+    "ffmpeg-static": "^4.4.0",
+    "child_process": "latest"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "author": "",
+  "license": "ISC"
+}
