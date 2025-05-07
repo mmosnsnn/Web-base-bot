@@ -1,186 +1,268 @@
-const { Client } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
+const { makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const ffmpeg = require('fluent-ffmpeg');
 const ytdl = require('ytdl-core');
-const ytSearch = require('yt-search');
+const ytsr = require('ytsr');
+const spotify = require('spotify-url-info');
 const fs = require('fs');
 const path = require('path');
-const { exec } = require('child_process');  // For converting audio formats
+const axios = require('axios');
 
-const client = new Client({
-    // Use localStorage for saving authentication data
-    puppeteer: {
-        headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
+// Replit setup
+const express = require('express');
+const app = express();
+const PORT = process.env.PORT || 3000;
+app.use(express.json());
+app.get('/', (req, res) => res.send('WhatsApp Downloader Bot Running'));
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+// Bot configuration
+const config = {
+  publicMode: false,
+  allowedUsers: [],
+  adminNumber: 'YOUR_ADMIN_NUMBER' // with country code
+};
+
+// Initialize WhatsApp
+async function startBot() {
+  const { state, saveCreds } = await useMultiFileAuthState('auth_info');
+  const { version } = await fetchLatestBaileysVersion();
+  
+  const sock = makeWASocket({
+    version,
+    auth: state,
+    printQRInTerminal: false,
+    browser: Browsers.macOS('Desktop'),
+    generateHighQualityLinkPreview: true,
+    getMessage: async () => ({})
+  });
+
+  // Pairing code for authentication
+  sock.ev.on('connection.update', (update) => {
+    const { connection, qr } = update;
+    
+    if (qr) console.log('Pairing Code:', qr);
+    if (connection === 'open') console.log('✅ Bot connected successfully!');
+    if (connection === 'close') {
+      const shouldReconnect = (update.lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut);
+      if (shouldReconnect) setTimeout(startBot, 5000);
     }
-});
+  });
 
-// Bot Owner's phone number (use the full phone number with country code)
-const BOT_OWNER = '917594898804@c.us';  // Replace with your actual phone number
+  sock.ev.on('creds.update', saveCreds);
 
-// List of allowed public commands
-const publicCommands = ['!song', '!groupinfo', '!help'];
-
-// Pairing Code Setup (For Initial Authentication)
-client.on('authenticated', (session) => {
-    console.log('Bot authenticated successfully!');
-    // Save session for later use
-    fs.writeFileSync('session.json', JSON.stringify(session));
-});
-
-// Try to load previous session (if available) for fast reconnection
-client.on('ready', () => {
-    console.log('Bot is ready!');
-});
-
-client.on('qr', (qr) => {
-    console.log('Pairing code generated: ', qr);
-    // You could also send the pairing code to the bot owner if you want
-    // For example, via email or another platform to scan manually.
-    console.log('Scan the pairing code in WhatsApp Web.');
-});
-
-client.on('message', async (message) => {
-    const sender = message.from;
-
-    // Command processing
-    if (message.body.startsWith('!')) {
-        // Check if the message is from the bot owner (private control)
-        const isOwner = sender === BOT_OWNER;
-
-        // Public commands
-        if (publicCommands.some(cmd => message.body.startsWith(cmd))) {
-            await handlePublicCommands(message);
-        }
-
-        // Private commands (only bot owner)
-        if (isOwner) {
-            await handleOwnerCommands(message);
-        }
-
-        // Group-specific commands
-        if (message.isGroupMsg) {
-            await handleGroupCommands(message);
-        }
+  // Message handler
+  sock.ev.on('messages.upsert', async ({ messages }) => {
+    const msg = messages[0];
+    if (!msg.message || msg.key.fromMe) return;
+    
+    const user = msg.key.remoteJid;
+    const text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
+    const isAdmin = user.includes(config.adminNumber);
+    
+    // Check if user is allowed in private mode
+    if (!config.publicMode && !config.allowedUsers.includes(user.split('@')[0]) && !isAdmin) {
+      await sock.sendMessage(user, { text: '🔒 Bot is in private mode. Contact admin for access.' });
+      return;
     }
-});
-
-// Handle public commands (accessible by everyone)
-async function handlePublicCommands(message) {
-    if (message.body.startsWith('!song ')) {
-        const query = message.body.slice(6).trim();
-        if (!query) {
-            message.reply("Please provide a song query. Example: !song Bohemian Rhapsody");
-            return;
-        }
-
-        // Search for the song on YouTube
-        const results = await ytSearch(query);
-        const videos = results.videos.slice(0, 5);
-
-        let response = 'Here are the top 5 search results:\n';
-        videos.forEach((video, index) => {
-            response += `${index + 1}. ${video.title} (Duration: ${video.duration})\n`;
-        });
-
-        message.reply(response);
-        message.reply('Reply with the number of the song you want to download.');
+    
+    // Admin commands
+    if (isAdmin && text.startsWith('!')) {
+      if (text === '!public') {
+        config.publicMode = true;
+        await sock.sendMessage(user, { text: '✅ Bot is now in public mode' });
+        return;
+      }
+      if (text === '!private') {
+        config.publicMode = false;
+        await sock.sendMessage(user, { text: '✅ Bot is now in private mode' });
+        return;
+      }
+      if (text.startsWith('!allow ')) {
+        const number = text.split(' ')[1];
+        config.allowedUsers.push(number);
+        await sock.sendMessage(user, { text: `✅ Added ${number} to allowed users` });
+        return;
+      }
     }
-
-    if (message.body.startsWith('!groupinfo')) {
-        // Example of a group command (public)
-        if (message.isGroupMsg) {
-            const groupInfo = await client.getGroupInfo(message.chatId);
-            message.reply(`Group Name: ${groupInfo.name}\nParticipants: ${groupInfo.participants.length}`);
-        } else {
-            message.reply('This command is only available in groups.');
-        }
+    
+    // Song download by query
+    if (text.startsWith('!song ')) {
+      const query = text.replace('!song ', '').trim();
+      await handleSongQuery(sock, user, query);
+      return;
     }
-
-    if (message.body.startsWith('!help')) {
-        message.reply("Commands:\n!song <song name> - Search and download songs\n!groupinfo - Get group information (only in groups)");
+    
+    // Media downloader
+    if (msg.message.imageMessage || msg.message.videoMessage) {
+      await handleMediaDownload(sock, msg);
+      return;
     }
+    
+    // Song downloader from URL
+    if (text.includes('youtube.com') || text.includes('youtu.be') || text.includes('spotify')) {
+      await handleSongDownload(sock, msg, text);
+      return;
+    }
+    
+    // Help menu
+    if (text === '!help') {
+      await sock.sendMessage(user, {
+        text: `📱 *WhatsApp Downloader Bot*\n\n` +
+              `*Features:*\n` +
+              `- Send !song <query> to download music\n` +
+              `- Send YouTube/Spotify links for audio\n` +
+              `- Send images/videos to download\n` +
+              `- Select video quality via buttons\n\n` +
+              `*Admin Commands:*\n` +
+              `!public - Enable public mode\n` +
+              `!private - Disable public mode\n` +
+              `!allow [number] - Add user to whitelist`
+      });
+      return;
+    }
+  });
+
+  // Handle button responses
+  sock.ev.on('messages.upsert', async ({ messages }) => {
+    const msg = messages[0];
+    if (!msg.message?.buttonsResponseMessage) return;
+    
+    const user = msg.key.remoteJid;
+    const buttonId = msg.message.buttonsResponseMessage.selectedButtonId;
+    
+    if (buttonId.startsWith('quality_')) {
+      const quality = buttonId.replace('quality_', '');
+      await handleVideoQuality(sock, user, quality);
+    }
+  });
 }
 
-// Handle private commands (only bot owner)
-async function handleOwnerCommands(message) {
-    if (message.body.startsWith('!clear')) {
-        // Clear command to delete messages (owner only)
-        const chat = await message.getChat();
-        chat.clearMessages();
-        message.reply('All messages cleared.');
-    }
+// YouTube search function
+async function searchYouTube(query) {
+  const filters = await ytsr.getFilters(query);
+  const filter = filters.get('Type').get('Video');
+  const searchResults = await ytsr(null, { limit: 1, nextpageRef: filter.url });
+  return searchResults.items[0]?.url;
 }
 
-// Handle group commands
-async function handleGroupCommands(message) {
-    if (message.body.startsWith('!groupstats')) {
-        // Show group stats (only in groups)
-        const groupInfo = await client.getGroupInfo(message.chatId);
-        message.reply(`Group: ${groupInfo.name}\nParticipants: ${groupInfo.participants.length}`);
+// Song download by query
+async function handleSongQuery(sock, user, query) {
+  try {
+    await sock.sendMessage(user, { text: `🔍 Searching for "${query}"...` });
+    
+    const youtubeUrl = await searchYouTube(query);
+    if (!youtubeUrl) {
+      await sock.sendMessage(user, { text: '❌ No results found.' });
+      return;
     }
+    
+    await sock.sendMessage(user, { text: '⬇️ Downloading audio...' });
+    const info = await ytdl.getInfo(youtubeUrl);
+    const title = info.videoDetails.title.replace(/[^\w\s]/gi, '');
+    const filename = `${title}.mp3`;
+    
+    await new Promise((resolve) => {
+      ffmpeg(ytdl(youtubeUrl, { quality: 'highestaudio' }))
+        .audioBitrate(320)
+        .save(filename)
+        .on('end', resolve);
+    });
+    
+    await sock.sendMessage(user, {
+      audio: { url: filename },
+      mimetype: 'audio/mpeg',
+      fileName: filename
+    });
+    
+    fs.unlinkSync(filename);
+  } catch (error) {
+    console.error(error);
+    await sock.sendMessage(user, { text: '❌ Failed to download song.' });
+  }
 }
 
-// Handle song download and conversion
-client.on('message', async (message) => {
-    if (message.body.startsWith('!download ')) {
-        const selection = parseInt(message.body.slice(10).trim()) - 1;
-
-        if (isNaN(selection) || selection < 0 || selection > 4) {
-            message.reply('Invalid selection. Please choose a number between 1 and 5.');
-            return;
-        }
-
-        const video = results.videos[selection];
-        const videoUrl = video.url;
-        const videoTitle = video.title.replace(/[^a-zA-Z0-9 ]/g, '');
-        message.reply(`Downloading: ${videoTitle}`);
-
-        // Download the audio from YouTube
-        try {
-            const stream = ytdl(videoUrl, { filter: 'audioonly', quality: 'highestaudio' });
-            const filePath = path.join(__dirname, 'downloads', `${videoTitle}.mp3`);
-            const writer = fs.createWriteStream(filePath);
-
-            stream.pipe(writer);
-
-            writer.on('finish', () => {
-                message.reply(`Download complete: ${videoTitle}.mp3`);
-                client.sendMessage(message.from, fs.readFileSync(filePath), { caption: 'Here is your song' });
-                fs.unlinkSync(filePath);  // Delete file after sending
-            });
-        } catch (error) {
-            message.reply('Failed to download song. Please try again.');
-        }
+// Media download handler
+async function handleMediaDownload(sock, msg) {
+  const user = msg.key.remoteJid;
+  const isImage = msg.message.imageMessage;
+  
+  try {
+    await sock.sendMessage(user, { text: '⏳ Downloading your media...' });
+    
+    const buffer = await sock.downloadMediaMessage(msg);
+    const filename = `media_${Date.now()}.${isImage ? 'jpg' : 'mp4'}`;
+    fs.writeFileSync(filename, buffer);
+    
+    if (isImage) {
+      await sock.sendMessage(user, {
+        image: { url: filename },
+        caption: '✅ Here is your downloaded image'
+      });
+    } else {
+      await sock.sendMessage(user, {
+        video: { url: filename },
+        caption: '✅ Here is your downloaded video'
+      });
     }
+    
+    fs.unlinkSync(filename);
+  } catch (error) {
+    console.error(error);
+    await sock.sendMessage(user, { text: '❌ Failed to download media' });
+  }
+}
 
-    // Converter command (Convert audio)
-    if (message.body.startsWith('!convert ')) {
-        const fileName = message.body.slice(9).trim();
-        const filePath = path.join(__dirname, 'downloads', `${fileName}.mp3`);
-
-        // Check if file exists
-        if (fs.existsSync(filePath)) {
-            const convertedFilePath = path.join(__dirname, 'downloads', `${fileName}.wav`);
-
-            // Convert audio using ffmpeg
-            exec(`ffmpeg -i ${filePath} ${convertedFilePath}`, (error, stdout, stderr) => {
-                if (error) {
-                    message.reply('Error converting the audio file.');
-                    return;
-                }
-
-                // Send the converted file
-                message.reply('Conversion complete. Sending WAV file...');
-                client.sendMessage(message.from, fs.readFileSync(convertedFilePath), { caption: 'Here is your converted file' });
-
-                // Clean up after sending
-                fs.unlinkSync(filePath);
-                fs.unlinkSync(convertedFilePath);
-            });
-        } else {
-            message.reply('Audio file not found. Please upload an MP3 first.');
-        }
+// Song download from URL
+async function handleSongDownload(sock, msg, url) {
+  const user = msg.key.remoteJid;
+  
+  try {
+    await sock.sendMessage(user, { text: '⏳ Processing your song request...' });
+    
+    let audioStream;
+    let title = 'downloaded_audio';
+    
+    if (url.includes('youtube.com') || url.includes('youtu.be')) {
+      const info = await ytdl.getInfo(url);
+      title = info.videoDetails.title.replace(/[^\w\s]/gi, '');
+      audioStream = ytdl(url, { quality: 'highestaudio' });
+    } else if (url.includes('spotify')) {
+      const spotifyInfo = await spotify.getData(url);
+      title = spotifyInfo.name;
+      const searchQuery = `${spotifyInfo.name} ${spotifyInfo.artists[0].name}`;
+      const youtubeUrl = await searchYouTube(searchQuery);
+      if (!youtubeUrl) throw new Error('No YouTube match found');
+      const info = await ytdl.getInfo(youtubeUrl);
+      title = info.videoDetails.title.replace(/[^\w\s]/gi, '');
+      audioStream = ytdl(youtubeUrl, { quality: 'highestaudio' });
     }
-});
+    
+    const filename = `${title}.mp3`;
+    
+    await new Promise((resolve) => {
+      ffmpeg(audioStream)
+        .audioBitrate(320)
+        .save(filename)
+        .on('end', resolve);
+    });
+    
+    await sock.sendMessage(user, {
+      audio: { url: filename },
+      mimetype: 'audio/mpeg',
+      fileName: filename
+    });
+    
+    fs.unlinkSync(filename);
+  } catch (error) {
+    console.error(error);
+    await sock.sendMessage(user, { text: '❌ Failed to download song' });
+  }
+}
 
-client.initialize();
+// Video quality handler
+async function handleVideoQuality(sock, user, quality) {
+  // Implement your video quality conversion logic here
+  await sock.sendMessage(user, { text: `✅ Video will be converted to ${quality} quality` });
+}
+
+startBot().catch(console.error);
